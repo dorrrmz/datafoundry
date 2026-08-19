@@ -76,7 +76,8 @@ import {
 } from "./interaction-runtime-adapter.js";
 import { RunCancelRegistry } from "./run-cancel-registry.js";
 import { RunEventPipeline } from "./run-event-pipeline.js";
-import { RunFinalizer, createRunStatusDelta } from "./run-finalizer.js";
+import { RunEpisodeLedger } from "./run-episode-ledger.js";
+import { RunFinalizer, createRunStatusDelta, type RunTerminalObserver } from "./run-finalizer.js";
 import { startSessionTitleTask } from "./session-title.js";
 import { TaskPlanProjector } from "./task-plan-projector.js";
 import { ToolCallResultBridge } from "./tool-call-result-bridge.js";
@@ -159,6 +160,7 @@ export type CreateServerOptions = {
   conversationMemoryMode?: AgentMemoryMode | undefined;
   memoryExtractionTimeoutMs?: number | undefined;
   metadataStore?: MetadataStore;
+  runTerminalObserver?: RunTerminalObserver | undefined;
   taskStateRuntime?: TaskStateRuntime;
 };
 
@@ -178,6 +180,9 @@ export const createServer = async (options: CreateServerOptions = {}): Promise<S
       ...(envConfig.storage.secret_master_key ? { secret_master_key: envConfig.storage.secret_master_key } : {})
     }),
   );
+  const runTerminalObserver = options.runTerminalObserver ?? new RunEpisodeLedger(metadataStore);
+  // TODO(self-evolve): reconcile terminal rows created outside RunFinalizer
+  // (early failures, persisted-only cancellation, and stale-run reclaim).
   const fileAssetService = new LocalFileAssetService(metadataStore, {
     storageRoot: process.env.FILE_ASSET_STORAGE_ROOT ?? join(envConfig.storage.root_dir, "files")
   });
@@ -327,6 +332,7 @@ export const createServer = async (options: CreateServerOptions = {}): Promise<S
           memoryExtractionTimeoutMs: options.memoryExtractionTimeoutMs
             ?? envConfig.memory.completed_extraction_timeout_ms,
           runCancelRegistry,
+          runTerminalObserver,
           user: authContext.user,
           workspaceId: authContext.workspaceId
         });
@@ -380,6 +386,7 @@ type HandleCopilotKitRequestInput = {
   knowledgeService: LocalKnowledgeService;
   memoryExtractionTimeoutMs: number;
   runCancelRegistry: RunCancelRegistry;
+  runTerminalObserver: RunTerminalObserver;
   taskStateRuntime: TaskStateRuntime;
   user: MeResponse;
   workspaceId: string;
@@ -397,6 +404,7 @@ const handleCopilotKitRequest = async ({
   knowledgeService,
   memoryExtractionTimeoutMs,
   runCancelRegistry,
+  runTerminalObserver,
   taskStateRuntime,
   user,
   workspaceId
@@ -413,6 +421,7 @@ const handleCopilotKitRequest = async ({
         memoryExtractionTimeoutMs,
         metadataStore,
         runCancelRegistry,
+        runTerminalObserver,
         taskStateRuntime,
         user,
         workspaceId,
@@ -448,6 +457,7 @@ type DataFoundryAgUiAgentInput = {
   knowledgeService: LocalKnowledgeService;
   memoryExtractionTimeoutMs: number;
   runCancelRegistry: RunCancelRegistry;
+  runTerminalObserver: RunTerminalObserver;
   taskStateRuntime: TaskStateRuntime;
   user: MeResponse;
   workspaceId: string;
@@ -739,6 +749,7 @@ class DataFoundryAgUiAgent extends AbstractAgent {
           memoryExtractionTimeoutMs: this.input.memoryExtractionTimeoutMs,
           metadataStore: this.input.metadataStore,
           runId,
+          runTerminalObserver: this.input.runTerminalObserver,
           sessionId,
           userId: this.input.user.id,
           sessionDir: agentAssembly.sessionDir,
@@ -947,12 +958,21 @@ class DataFoundryAgUiAgent extends AbstractAgent {
                 file_ids: effectiveRunConfig.fileIds,
                 enabled_knowledge_ids: effectiveRunConfig.enabledKnowledgeIds,
                 enabled_mcp_server_ids: effectiveRunConfig.enabledMcpServerIds,
+                enabled_skill_ids: effectiveRunConfig.enabledSkillIds,
+                skill_ids: effectiveRunConfig.skillIds,
+                skill_policy: effectiveRunConfig.skillPolicy,
+                skill_tags: effectiveRunConfig.skillTags,
                 selected_skill_ids: selectedSkills.map((skill) => skill.id),
                 skill_mode: effectiveRunConfig.skillMode,
                 requested_llm_profile_id: effectiveRunConfig.activeLlmProfileId,
                 active_llm_profile_id: effectiveRunConfig.activeLlmProfileId,
+                model_name: modelProvider.model_name,
+                resource_revisions: effectiveRunConfig.resourceRevisions ?? {},
                 workspace_id: this.input.workspaceId,
                 workspace: agentAssembly.workspace,
+                ...(effectiveRunConfig.protocol ? { protocol: effectiveRunConfig.protocol } : {}),
+                ...(effectiveRunConfig.goal ? { goal: effectiveRunConfig.goal } : {}),
+                ...(modelSettings ? { model_settings: modelSettings } : {}),
                 ...(modelContextProfile
                   ? {
                       context_window: modelContextProfile.contextWindow,

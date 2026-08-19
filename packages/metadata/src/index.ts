@@ -11,8 +11,10 @@ import {
   EncryptedSecretStore,
   initializeConfigSchema
 } from "./config-store.js";
+import { initializeEvolutionLedgerSchema, RunEpisodeRepository } from "./evolution-ledger.js";
 
 export * from "./config-store.js";
+export * from "./evolution-ledger.js";
 
 export type UserRecord = {
   id: string;
@@ -685,6 +687,7 @@ export class MetadataStore {
   readonly queryHistory: QueryHistoryRepository;
   readonly protocolStates: ProtocolStateSnapshotRepository;
   readonly runEvents: RunEventRepository;
+  readonly runEpisodes: RunEpisodeRepository;
   readonly runs: RunRepository;
   readonly sessionBranches: SessionBranchRepository;
   readonly sessionIntents: SessionIntentRepository;
@@ -708,6 +711,7 @@ export class MetadataStore {
     this.sessions = new SessionRepository(db);
     this.runs = new RunRepository(db);
     this.runEvents = new RunEventRepository(db);
+    this.runEpisodes = new RunEpisodeRepository(db);
     this.sessionBranches = new SessionBranchRepository(db);
     this.sessionIntents = new SessionIntentRepository(db);
     this.conversationMessages = new ConversationMessageRepository(db);
@@ -1398,6 +1402,10 @@ export class SessionRepository {
       `).run(...scope);
 
       if (runIds.length > 0) {
+        this.db.prepare(`
+          DELETE FROM run_episodes
+          WHERE user_id = ? AND run_id IN (${runPlaceholders})
+        `).run(input.user_id, ...runIds);
         this.db.prepare(`
           DELETE FROM protocol_state_snapshots
           WHERE user_id = ? AND run_id IN (${runPlaceholders})
@@ -4100,6 +4108,9 @@ const runMigrations = (db: DatabaseSync): void => {
   });
   runSchemaMigration(db, "0018_session_intents", "Ensure session intent schema", () => {
     initializeSessionIntentSchema(db);
+  });
+  runSchemaMigration(db, "0019_run_episodes", "Ensure immutable run episode ledger schema", () => {
+    initializeEvolutionLedgerSchema(db);
   });
 };
 

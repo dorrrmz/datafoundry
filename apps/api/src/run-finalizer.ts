@@ -11,6 +11,21 @@ import type { MetadataStore } from "@datafoundry/metadata";
 
 export type RunStatus = "running" | "suspended" | "completed" | "failed" | "canceled";
 
+export type RunTerminalStatus = Extract<RunStatus, "completed" | "failed" | "canceled">;
+
+export type RunTerminalObservation = {
+  runId: string;
+  sessionId: string;
+  status: RunTerminalStatus;
+  userId: string;
+  workspaceId: string;
+};
+
+/** Receives durable terminal runs after their terminal AG-UI event has been persisted. */
+export type RunTerminalObserver = {
+  observeTerminal(input: RunTerminalObservation): void;
+};
+
 type RunFinalizerInput = {
   destroyWorkspace(): Promise<void>;
   emit(event: BaseEvent): void;
@@ -20,6 +35,7 @@ type RunFinalizerInput = {
   memoryExtractionTimeoutMs: number;
   metadataStore: MetadataStore;
   runId: string;
+  runTerminalObserver?: RunTerminalObserver | undefined;
   /** Per-session directory; agent outputs here are synced to session-scoped file_asset_refs. */
   sessionDir: string;
   sessionId: string;
@@ -55,6 +71,7 @@ export class RunFinalizer {
     this.input.emit(createRunStatusDelta("canceled", { runId: this.input.runId }));
     await this.input.destroyWorkspace().catch(() => undefined);
     this.input.emit(input.terminalEvent);
+    this.observeTerminal("canceled");
   }
 
   async cancelRun(input: { reason?: string | undefined; terminalEvent: BaseEvent }): Promise<void> {
@@ -72,6 +89,7 @@ export class RunFinalizer {
     }));
     await this.input.destroyWorkspace().catch(() => undefined);
     this.input.emit(input.terminalEvent);
+    this.observeTerminal("canceled");
   }
 
   async complete(input: {
@@ -107,6 +125,7 @@ export class RunFinalizer {
     this.input.emit(createRunStatusDelta("completed", { runId: this.input.runId }));
     await this.input.destroyWorkspace().catch(() => undefined);
     this.input.emit(input.terminalEvent);
+    this.observeTerminal("completed");
   }
 
   fail(input: { errorMessage: string; terminalEvent: BaseEvent }): void {
@@ -123,6 +142,25 @@ export class RunFinalizer {
     }));
     void this.input.destroyWorkspace().catch(() => undefined);
     this.input.emit(input.terminalEvent);
+    this.observeTerminal("failed");
+  }
+
+  private observeTerminal(status: RunTerminalStatus): void {
+    try {
+      this.input.runTerminalObserver?.observeTerminal({
+        runId: this.input.runId,
+        sessionId: this.input.sessionId,
+        status,
+        userId: this.input.userId,
+        workspaceId: this.input.workspaceId
+      });
+    } catch (error) {
+      console.warn("[data-foundry] run terminal observer failed", {
+        error: errorMessage(error),
+        runId: this.input.runId,
+        status
+      });
+    }
   }
 
   /**
