@@ -35,6 +35,24 @@ export type RunEpisodeScope = {
   workspace_id: string;
 };
 
+export type RunEpisodeReconciliationCursor = {
+  run_id: string;
+  sort_at: string;
+  user_id: string;
+};
+
+export type TerminalRunReconciliationCandidate = RunEpisodeReconciliationCursor & {
+  episode_id?: string;
+  session_id: string;
+  status: RunEpisodeTerminalStatus;
+  workspace_id: string;
+};
+
+export type TerminalRunReconciliationQuery = {
+  parameters: Array<number | string>;
+  sql: string;
+};
+
 /** Append-only persistence for immutable, replayable terminal-run snapshots. */
 export class RunEpisodeRepository {
   constructor(private readonly db: DatabaseSync) {}
@@ -75,6 +93,19 @@ export class RunEpisodeRepository {
       throw new Error(`RUN_EPISODE_NOT_FOUND:${input.episode_id}`);
     }
     return episode;
+  }
+
+  /** Stable oldest-first scan over all terminal rows, including recorded episodes. */
+  listTerminalForReconciliation(input: {
+    after?: RunEpisodeReconciliationCursor | undefined;
+    finished_before?: string | undefined;
+    limit?: number | undefined;
+  } = {}): TerminalRunReconciliationCandidate[] {
+    const limit = Number.isInteger(input.limit)
+      ? Math.max(1, Math.min(input.limit as number, 500))
+      : 100;
+    const query = buildTerminalRunReconciliationQuery({ ...input, limit });
+    return this.db.prepare(query.sql).all(...query.parameters).map(mapTerminalRunReconciliationCandidate);
   }
 
   private findByRunIdentity(input: { user_id: string; run_id: string }): RunEpisodeRecord | undefined {
@@ -180,6 +211,72 @@ export class RunEpisodeRepository {
   }
 }
 
+/** Shared so query-plan tests exercise the exact production SQL and parameters. */
+export const buildTerminalRunReconciliationQuery = (input: {
+  after?: RunEpisodeReconciliationCursor | undefined;
+  finished_before?: string | undefined;
+  limit: number;
+}): TerminalRunReconciliationQuery => {
+  const sortExpression = "run.finished_at";
+  const afterClause = input.after
+    ? `AND (
+        ${sortExpression} > ?
+        OR (${sortExpression} = ? AND run.user_id > ?)
+        OR (${sortExpression} = ? AND run.user_id = ? AND run.id > ?)
+      )`
+    : "";
+  const afterParameters = input.after
+    ? [
+        input.after.sort_at,
+        input.after.sort_at,
+        input.after.user_id,
+        input.after.sort_at,
+        input.after.user_id,
+        input.after.run_id
+      ]
+    : [];
+  const settledClause = input.finished_before ? `AND ${sortExpression} <= ?` : "";
+  const settledParameters = input.finished_before ? [input.finished_before] : [];
+  return {
+    sql: `
+      SELECT
+        run.id AS run_id,
+        run.user_id,
+        run.session_id,
+        run.status,
+        ${sortExpression} AS sort_at,
+        workspace.id AS workspace_id,
+        episode.id AS episode_id
+      FROM runs AS run
+      LEFT JOIN run_episodes AS episode
+        ON episode.user_id = run.user_id
+        AND episode.run_id = run.id
+      JOIN workspaces AS workspace
+        ON workspace.id = COALESCE(
+          episode.workspace_id,
+          (
+            SELECT candidate.id
+            FROM workspaces AS candidate
+            JOIN workspace_memberships AS membership
+              ON membership.workspace_id = candidate.id
+              AND membership.user_id = run.user_id
+            WHERE candidate.kind = 'personal'
+              AND candidate.owner_user_id = run.user_id
+            ORDER BY candidate.created_at ASC, candidate.id ASC
+            LIMIT 1
+          )
+        )
+      WHERE run.status IN ('completed', 'failed', 'canceled')
+        AND run.finished_at IS NOT NULL
+        ${afterClause}
+        ${settledClause}
+      ORDER BY ${sortExpression} ASC, run.user_id ASC, run.id ASC
+      LIMIT ?
+    `,
+    parameters: [...afterParameters, ...settledParameters, input.limit]
+  };
+};
+
 export const initializeEvolutionLedgerSchema = (db: DatabaseSync): void => {
   db.exec(`
     CREATE TABLE IF NOT EXISTS run_episodes (
@@ -208,6 +305,9 @@ export const initializeEvolutionLedgerSchema = (db: DatabaseSync): void => {
       ON run_episodes(workspace_id, user_id, terminal_status, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_run_episodes_datasource
       ON run_episodes(workspace_id, user_id, datasource_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_runs_terminal_reconciliation
+      ON runs(finished_at, user_id, id)
+      WHERE status IN ('completed', 'failed', 'canceled') AND finished_at IS NOT NULL;
     CREATE TRIGGER IF NOT EXISTS trg_run_episodes_immutable_update
       BEFORE UPDATE ON run_episodes
       BEGIN
@@ -336,6 +436,21 @@ const mapRunEpisodeRow = (row: unknown): RunEpisodeRecord | undefined => {
     snapshot_json: requiredString(row, "snapshot_json"),
     snapshot_hash: requiredString(row, "snapshot_hash"),
     created_at: requiredString(row, "created_at")
+  };
+};
+
+const mapTerminalRunReconciliationCandidate = (row: unknown): TerminalRunReconciliationCandidate => {
+  if (!isRecord(row)) {
+    throw new Error("Expected terminal run reconciliation row");
+  }
+  return {
+    ...(typeof row.episode_id === "string" ? { episode_id: row.episode_id } : {}),
+    run_id: requiredString(row, "run_id"),
+    session_id: requiredString(row, "session_id"),
+    sort_at: requiredString(row, "sort_at"),
+    status: requiredTerminalStatus(row, "status"),
+    user_id: requiredString(row, "user_id"),
+    workspace_id: requiredString(row, "workspace_id")
   };
 };
 

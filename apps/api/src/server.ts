@@ -77,6 +77,11 @@ import {
 import { RunCancelRegistry } from "./run-cancel-registry.js";
 import { RunEventPipeline } from "./run-event-pipeline.js";
 import { RunEpisodeLedger } from "./run-episode-ledger.js";
+import {
+  RunEpisodeReconciler,
+  RunEpisodeReconciliationScheduler,
+  type RunEpisodeReconciliationRunner
+} from "./run-episode-reconciler.js";
 import { RunFinalizer, createRunStatusDelta, type RunTerminalObserver } from "./run-finalizer.js";
 import { startSessionTitleTask } from "./session-title.js";
 import { TaskPlanProjector } from "./task-plan-projector.js";
@@ -160,6 +165,8 @@ export type CreateServerOptions = {
   conversationMemoryMode?: AgentMemoryMode | undefined;
   memoryExtractionTimeoutMs?: number | undefined;
   metadataStore?: MetadataStore;
+  runEpisodeReconciler?: RunEpisodeReconciliationRunner | undefined;
+  runEpisodeReconciliationIntervalMs?: number | undefined;
   runTerminalObserver?: RunTerminalObserver | undefined;
   taskStateRuntime?: TaskStateRuntime;
 };
@@ -180,9 +187,18 @@ export const createServer = async (options: CreateServerOptions = {}): Promise<S
       ...(envConfig.storage.secret_master_key ? { secret_master_key: envConfig.storage.secret_master_key } : {})
     }),
   );
-  const runTerminalObserver = options.runTerminalObserver ?? new RunEpisodeLedger(metadataStore);
-  // TODO(self-evolve): reconcile terminal rows created outside RunFinalizer
-  // (early failures, persisted-only cancellation, and stale-run reclaim).
+  const runEpisodeLedger = new RunEpisodeLedger(metadataStore);
+  const runTerminalObserver = options.runTerminalObserver ?? runEpisodeLedger;
+  const runEpisodeReconciler = options.runEpisodeReconciler
+    ?? new RunEpisodeReconciler(metadataStore, { observer: runEpisodeLedger });
+  const runEpisodeReconciliationScheduler = new RunEpisodeReconciliationScheduler(
+    runEpisodeReconciler,
+    {
+      ...(options.runEpisodeReconciliationIntervalMs !== undefined
+        ? { intervalMs: options.runEpisodeReconciliationIntervalMs }
+        : {})
+    }
+  );
   const fileAssetService = new LocalFileAssetService(metadataStore, {
     storageRoot: process.env.FILE_ASSET_STORAGE_ROOT ?? join(envConfig.storage.root_dir, "files")
   });
@@ -365,11 +381,16 @@ export const createServer = async (options: CreateServerOptions = {}): Promise<S
   });
 
   server.on("close", () => {
+    runEpisodeReconciliationScheduler.stop();
     metadataStore.close();
     if (ownsTaskStateRuntime) {
       void taskStateRuntime.close();
     }
   });
+
+  // Defer the first bounded scan until after createServer returns; full pages
+  // continue on later timer turns so historical recovery never gates readiness.
+  runEpisodeReconciliationScheduler.start();
 
   return server;
 };

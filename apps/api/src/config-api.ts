@@ -55,6 +55,7 @@ import { basename, join, resolve, sep } from "node:path";
 import writeXlsxFile, { type SheetData } from "write-excel-file/node";
 
 import { resolveEffectiveRunConfig } from "./run-input.js";
+import { handleEvolutionApiRequest } from "./evolution-api.js";
 import {
   llmEnvFingerprint,
   modelProfileConnectivityPayloadChanged,
@@ -170,6 +171,11 @@ const routeConfigRequest = async (
 ): Promise<ConfigApiResponse> => {
   const segments = pathname.slice("/api/v1/".length).split("/").filter(Boolean);
   const root = segments[0] ?? "";
+
+  const evolutionResponse = await handleEvolutionApiRequest(request, root, segments.slice(1), context);
+  if (evolutionResponse) {
+    return evolutionResponse;
+  }
 
   if (root === "me") {
     return handleMeRequest(request, context);
@@ -3781,6 +3787,37 @@ const handleSkillSelectionPreview = async (
 
 const errorResponse = (error: unknown): ConfigApiResponse => {
   const message = messageOf(error);
+  if (message.startsWith("REQUEST_BODY_TOO_LARGE")) {
+    return fail(413, "BAD_REQUEST", message);
+  }
+  if (message.startsWith("EVAL_CASE_SOURCE_SNAPSHOT_INVALID")) {
+    return fail(500, "INTERNAL_ERROR", message);
+  }
+  if (
+    message.includes("IDEMPOTENCY_CONFLICT")
+    || message.startsWith("EVAL_SUITE_REVISION_CONFLICT")
+    || message.includes("MEMBERSHIP_CONFLICT")
+    || message.includes("ORDINAL_CONFLICT")
+    || message.startsWith("EVAL_SUITE_NOT_DRAFT")
+    || message.startsWith("EVAL_SUITE_NOT_SEALED")
+    || message.startsWith("EVAL_SUITE_EMPTY")
+    || message.startsWith("EPISODE_FEEDBACK_ALREADY_SUPERSEDED")
+    || message.startsWith("EPISODE_FEEDBACK_SUPERSESSION_INVALID")
+  ) {
+    return fail(409, "CONFLICT", message);
+  }
+  if (
+    message.startsWith("EPISODE_FEEDBACK_")
+    && (
+      message.includes("UNSUPPORTED")
+      || message.includes("NOT_SUPPORTED")
+      || message.includes("MANAGED_BY_AUTH")
+      || message.includes("RATING_NOT_ALLOWED")
+      || message.includes("LABEL_EMPTY")
+    )
+  ) {
+    return fail(400, "BAD_REQUEST", message);
+  }
   if (message.startsWith("REVISION_CONFLICT")) {
     return fail(409, "REVISION_CONFLICT", message);
   }

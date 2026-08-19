@@ -11,9 +11,16 @@ import {
   EncryptedSecretStore,
   initializeConfigSchema
 } from "./config-store.js";
+import {
+  EvalCaseRepository,
+  EvalSuiteRepository,
+  initializeEvaluationAssetsSchema,
+  RunEpisodeFeedbackRepository
+} from "./evaluation-assets.js";
 import { initializeEvolutionLedgerSchema, RunEpisodeRepository } from "./evolution-ledger.js";
 
 export * from "./config-store.js";
+export * from "./evaluation-assets.js";
 export * from "./evolution-ledger.js";
 
 export type UserRecord = {
@@ -680,6 +687,8 @@ export class MetadataStore {
   readonly conversationSummaries: ConversationSummaryRepository;
   readonly contextPackageSnapshots: ContextPackageSnapshotRepository;
   readonly dataSources: DataSourceRepository;
+  readonly evalCases: EvalCaseRepository;
+  readonly evalSuites: EvalSuiteRepository;
   readonly fileAssetRefs: FileAssetRefRepository;
   readonly fileAssets: FileAssetRepository;
   readonly interactions: InteractionRepository;
@@ -687,6 +696,7 @@ export class MetadataStore {
   readonly queryHistory: QueryHistoryRepository;
   readonly protocolStates: ProtocolStateSnapshotRepository;
   readonly runEvents: RunEventRepository;
+  readonly runEpisodeFeedback: RunEpisodeFeedbackRepository;
   readonly runEpisodes: RunEpisodeRepository;
   readonly runs: RunRepository;
   readonly sessionBranches: SessionBranchRepository;
@@ -712,6 +722,7 @@ export class MetadataStore {
     this.runs = new RunRepository(db);
     this.runEvents = new RunEventRepository(db);
     this.runEpisodes = new RunEpisodeRepository(db);
+    this.runEpisodeFeedback = new RunEpisodeFeedbackRepository(db);
     this.sessionBranches = new SessionBranchRepository(db);
     this.sessionIntents = new SessionIntentRepository(db);
     this.conversationMessages = new ConversationMessageRepository(db);
@@ -724,6 +735,8 @@ export class MetadataStore {
     this.traceSections = new TraceSectionRepository(db);
     this.contextPackageSnapshots = new ContextPackageSnapshotRepository(db);
     this.dataSources = new DataSourceRepository(db);
+    this.evalCases = new EvalCaseRepository(db);
+    this.evalSuites = new EvalSuiteRepository(db);
     this.fileAssets = new FileAssetRepository(db);
     this.fileAssetRefs = new FileAssetRefRepository(db);
     this.interactions = new InteractionRepository(db);
@@ -1403,6 +1416,14 @@ export class SessionRepository {
 
       if (runIds.length > 0) {
         this.db.prepare(`
+          DELETE FROM run_episode_feedback
+          WHERE user_id = ?
+            AND episode_id IN (
+              SELECT id FROM run_episodes
+              WHERE user_id = ? AND run_id IN (${runPlaceholders})
+            )
+        `).run(input.user_id, input.user_id, ...runIds);
+        this.db.prepare(`
           DELETE FROM run_episodes
           WHERE user_id = ? AND run_id IN (${runPlaceholders})
         `).run(input.user_id, ...runIds);
@@ -2027,6 +2048,36 @@ export class RunEventRepository {
       .prepare("SELECT * FROM run_events WHERE user_id = ? AND run_id = ? ORDER BY seq ASC")
       .all(input.user_id, input.run_id)
       .map(mapRequiredRunEventRow);
+  }
+
+  latestByRun(input: { user_id: string; run_id: string }): RunEventRecord | undefined {
+    return mapRunEventRow(this.db.prepare(`
+      SELECT * FROM run_events
+      WHERE user_id = ? AND run_id = ?
+      ORDER BY seq DESC
+      LIMIT 1
+    `).get(input.user_id, input.run_id));
+  }
+
+  /** Counts at most `limit` rows so callers can enforce a bounded preflight cap. */
+  countByRunUpTo(input: { user_id: string; run_id: string; limit: number }): number {
+    if (!Number.isInteger(input.limit) || input.limit < 1) {
+      throw new Error(`RUN_EVENT_COUNT_LIMIT_INVALID:${input.limit}`);
+    }
+    const row = this.db.prepare(`
+      SELECT COUNT(*) AS event_count
+      FROM (
+        SELECT 1
+        FROM run_events
+        WHERE user_id = ? AND run_id = ?
+        ORDER BY seq ASC
+        LIMIT ?
+      )
+    `).get(input.user_id, input.run_id, input.limit);
+    if (!isRecord(row) || typeof row.event_count !== "number") {
+      throw new Error(`Unable to count events for run: ${input.run_id}`);
+    }
+    return row.event_count;
   }
 
   private getBySeq(input: { user_id: string; run_id: string; seq: number }): RunEventRecord {
@@ -4111,6 +4162,9 @@ const runMigrations = (db: DatabaseSync): void => {
   });
   runSchemaMigration(db, "0019_run_episodes", "Ensure immutable run episode ledger schema", () => {
     initializeEvolutionLedgerSchema(db);
+  });
+  runSchemaMigration(db, "0020_evaluation_assets", "Ensure evaluation assets and episode feedback schema", () => {
+    initializeEvaluationAssetsSchema(db);
   });
 };
 

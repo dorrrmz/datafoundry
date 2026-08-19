@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import {
+  buildTerminalRunReconciliationQuery,
   createMetadataStore,
   createVerifiedTestIdentity,
   type MetadataStore,
@@ -274,6 +275,91 @@ describe("RunEpisodeRepository", () => {
     }
   });
 
+  it("pages every terminal row before filtering recorded episodes", () => {
+    const fixture = createFixture("reconciliation-candidates");
+    try {
+      const oldest = seedRun(fixture.metadata, "candidate-oldest", "completed");
+      const recorded = seedRun(fixture.metadata, "candidate-recorded", "failed");
+      const newest = seedRun(fixture.metadata, "candidate-newest", "canceled");
+      const missingFinishedAt = seedRun(fixture.metadata, "candidate-no-finished-at", "failed");
+      seedRun(fixture.metadata, "candidate-running", "running");
+      setFinishedAt(fixture.metadata, oldest, "2026-08-19T00:00:01.000Z");
+      setFinishedAt(fixture.metadata, recorded, "2026-08-19T00:00:02.000Z");
+      setFinishedAt(fixture.metadata, newest, "2026-08-19T00:00:03.000Z");
+      fixture.metadata.runEpisodes.append({
+        user_id: recorded.userId,
+        workspace_id: recorded.workspaceId,
+        run_id: recorded.runId,
+        schema_version: 1,
+        terminal_event_seq: recorded.eventSeq,
+        snapshot: { recorded: true }
+      });
+
+      const firstPage = fixture.metadata.runEpisodes.listTerminalForReconciliation({ limit: 1 });
+      expect(firstPage).toEqual([expect.objectContaining({
+        run_id: oldest.runId,
+        session_id: oldest.sessionId,
+        status: "completed",
+        user_id: oldest.userId,
+        workspace_id: oldest.workspaceId,
+        sort_at: "2026-08-19T00:00:01.000Z"
+      })]);
+
+      const secondPage = fixture.metadata.runEpisodes.listTerminalForReconciliation({
+        after: {
+          run_id: firstPage[0]!.run_id,
+          sort_at: firstPage[0]!.sort_at,
+          user_id: firstPage[0]!.user_id
+        },
+        limit: 1
+      });
+      expect(secondPage).toEqual([expect.objectContaining({
+        episode_id: `episode:${recorded.runId}`,
+        run_id: recorded.runId,
+        workspace_id: recorded.workspaceId
+      })]);
+      const thirdPage = fixture.metadata.runEpisodes.listTerminalForReconciliation({
+        after: {
+          run_id: secondPage[0]!.run_id,
+          sort_at: secondPage[0]!.sort_at,
+          user_id: secondPage[0]!.user_id
+        },
+        limit: 10
+      });
+      expect(thirdPage.map((candidate) => candidate.run_id)).toEqual([newest.runId]);
+      expect(thirdPage.map((candidate) => candidate.run_id)).not.toContain(missingFinishedAt.runId);
+      expect(fixture.metadata.db.prepare(`
+        SELECT name FROM sqlite_master
+        WHERE type = 'index' AND name = 'idx_runs_terminal_reconciliation'
+      `).get()).toEqual({ name: "idx_runs_terminal_reconciliation" });
+      const queries = [
+        buildTerminalRunReconciliationQuery({
+          finished_before: "2026-08-20T00:00:00.000Z",
+          limit: 100
+        }),
+        buildTerminalRunReconciliationQuery({
+          after: {
+            run_id: oldest.runId,
+            sort_at: "2026-08-19T00:00:01.000Z",
+            user_id: oldest.userId
+          },
+          finished_before: "2026-08-20T00:00:00.000Z",
+          limit: 100
+        })
+      ];
+      for (const query of queries) {
+        const queryPlan = fixture.metadata.db.prepare(`EXPLAIN QUERY PLAN ${query.sql}`)
+          .all(...query.parameters) as Array<{ detail: string; parent: number }>;
+        expect(queryPlan.some((row) => row.detail.includes("idx_runs_terminal_reconciliation"))).toBe(true);
+        expect(queryPlan.some((row) =>
+          row.parent === 0 && row.detail.includes("USE TEMP B-TREE FOR ORDER BY")
+        )).toBe(false);
+      }
+    } finally {
+      fixture.close();
+    }
+  });
+
   it("rejects direct updates with the immutable-ledger trigger", () => {
     const fixture = createFixture("immutable");
     try {
@@ -398,4 +484,13 @@ const seedRun = (
           : { type: EventType.RUN_FINISHED, threadId: sessionId, runId }
       });
   return { eventSeq: event.seq, runId, sessionId, userId, workspaceId };
+};
+
+const setFinishedAt = (
+  metadata: MetadataStore,
+  run: { runId: string; userId: string },
+  finishedAt: string
+): void => {
+  metadata.db.prepare("UPDATE runs SET finished_at = ? WHERE user_id = ? AND id = ?")
+    .run(finishedAt, run.userId, run.runId);
 };
